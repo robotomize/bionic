@@ -145,7 +145,7 @@ func (m *Manager) executeHooks() {
 }
 
 type Job struct {
-	ID            uuid.UUID   `json:"id"`
+	ID            string      `json:"id"`
 	ExecutionTime int64       `json:"executionTime"`
 	Payload       interface{} `json:"payload"`
 }

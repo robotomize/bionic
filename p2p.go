@@ -12,7 +12,7 @@ import (
 	"io/ioutil"
 )
 
-func ServeP2P() {
+func ServeP2P(hub *ConnsHub) {
 	r := rand.Reader
 	prvKey, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
 	if err != nil {
@@ -30,8 +30,7 @@ func ServeP2P() {
 		panic(err)
 	}
 
-	h := newHandler()
-	host.SetStreamHandler("/", h.handle)
+	host.SetStreamHandler("/", hub.handle)
 	var port string
 	for _, la := range host.Network().ListenAddresses() {
 		if p, err := la.ValueForProtocol(multiaddr.P_TCP); err == nil {
@@ -46,62 +45,69 @@ func ServeP2P() {
 	<-m
 }
 
-type Handler struct {
-	in      chan []byte
+type ConnsHub struct {
 	out     chan []byte
 	closeCh chan struct{}
 	cancel  func()
 	conns   []*Conn
 }
 
-func newHandler() *Handler {
-	return &Handler{}
+func NewConnsHub() *ConnsHub {
+	return &ConnsHub{
+		out:     make(chan []byte, 1),
+		closeCh: make(chan struct{}, 1),
+		conns:   []*Conn{},
+	}
 }
 
-func (h *Handler) Stop() {
+func (h *ConnsHub) Stop() {
 	h.cancel()
 }
 
-func (h *Handler) handle(s network.Stream) {
+func (h *ConnsHub) handle(s network.Stream) {
 	ctx, cancel := context.WithCancel(context.TODO())
 	h.cancel = cancel
 	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
 	c := &Conn{
-		ID:  s.Conn().LocalPeer().String(),
-		in:  make(chan []byte, 1),
-		out: make(chan []byte, 1),
+		ID:     s.Conn().LocalPeer().String(),
+		buffer: rw,
+		out:    h.out,
 	}
-	c.read(ctx, rw)
-	c.write(ctx, rw)
+	c.read(ctx)
 	h.conns = append(h.conns, c)
 }
 
-func (h *Handler) Register() {
+func (h *ConnsHub) SendTo(ID string, payload []byte) {
+	for _, c := range h.conns {
+		if c.ID == ID {
+			c.write(payload)
+		}
+	}
+}
+
+func (h *ConnsHub) Register() {
 
 }
 
-func (h *Handler) Unregister() {
+func (h *ConnsHub) Unregister() {
 
 }
 
 type Conn struct {
-	ID  string
-	in  chan []byte
-	out chan []byte
+	ID     string
+	out    chan []byte
+	buffer *bufio.ReadWriter
 }
 
-func (h *Conn) read(ctx context.Context, rw *bufio.ReadWriter) {
+func (c *Conn) read(ctx context.Context) {
 	go func() {
-		defer func() {
-			h.closeCh <- struct{}{}
-		}()
 		for {
-			b, err := ioutil.ReadAll(rw)
+			b, err := ioutil.ReadAll(c.buffer)
 			if err != nil {
 				fmt.Printf(err.Error())
 				return
 			}
-			h.out <- b
+			c.out <- b
 			select {
 			case <-ctx.Done():
 				return
@@ -111,26 +117,14 @@ func (h *Conn) read(ctx context.Context, rw *bufio.ReadWriter) {
 	}()
 }
 
-func (h *Conn) write(ctx context.Context, rw *bufio.ReadWriter) {
-	go func() {
-		defer func() {
-			h.closeCh <- struct{}{}
-		}()
-		for {
-			select {
-			case msg := <-h.in:
-				n, err := rw.Write(msg)
-				if err != nil || n == 0 {
-					fmt.Printf(err.Error())
-					return
-				}
-				if err := rw.Flush(); err != nil {
-					fmt.Printf(err.Error())
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+func (c *Conn) write(msg []byte) {
+	_, err := c.buffer.Write(msg)
+	if err != nil {
+		fmt.Printf(err.Error())
+		return
+	}
+	if err := c.buffer.Flush(); err != nil {
+		fmt.Printf(err.Error())
+		return
+	}
 }
