@@ -9,15 +9,22 @@ import (
 	"time"
 )
 
+const DefaultAddr = 53300
+
+type Server struct {
+}
+
+func New() {
+
+}
+
 const (
 	DefaultRunnerNumber     = 1
-	DefaultAddr             = "localhost:53300"
 	DefaultMaxExecutionTime = 30 * time.Second
 )
 
 var defaultOptions = ManagerOptions{
 	runnerNumber:  DefaultRunnerNumber,
-	addr:          DefaultAddr,
 	executionTime: DefaultMaxExecutionTime,
 }
 
@@ -29,6 +36,10 @@ type Manager struct {
 
 	cMu     sync.RWMutex
 	clients map[uuid.UUID]*Session
+
+	transportIn      chan []byte
+	transportOut     chan []byte
+	transportCloseCh chan struct{}
 }
 
 func NewManager(opt ...ManagerOption) *Manager {
