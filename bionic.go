@@ -6,79 +6,87 @@ import (
 	"github.com/google/uuid"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
-	DefaultRunnerNumber = 1
-	DefaultAddr         = "localhost:53300"
+	DefaultRunnerNumber     = 1
+	DefaultAddr             = "localhost:53300"
+	DefaultMaxExecutionTime = 30 * time.Second
 )
 
-var defaultOptions = Options{
-	runnerNumber: DefaultRunnerNumber,
-	addr:         DefaultAddr,
+var defaultOptions = ManagerOptions{
+	runnerNumber:  DefaultRunnerNumber,
+	addr:          DefaultAddr,
+	executionTime: DefaultMaxExecutionTime,
 }
 
-type BHook func() error
-
 type Manager struct {
-	hooks  []BHook
+	hooks  []BHookFunc
 	taskCh chan interface{}
-	opts   Options
+	opts   ManagerOptions
 	cancel func()
 
 	cMu     sync.RWMutex
-	clients map[uuid.UUID]*Client
+	clients map[uuid.UUID]*Session
 }
 
-func New(opt ...Option) *Manager {
+func NewManager(opt ...ManagerOption) *Manager {
 	opts := defaultOptions
 	for _, o := range opt {
 		o.apply(&opts)
 	}
 	return &Manager{
-		hooks:   []BHook{},
+		hooks:   []BHookFunc{},
 		taskCh:  make(chan interface{}, 1),
 		opts:    opts,
 		cancel:  nil,
 		cMu:     sync.RWMutex{},
-		clients: map[uuid.UUID]*Client{},
+		clients: map[uuid.UUID]*Session{},
 	}
 }
 
-type Option interface {
-	apply(*Options)
+type ManagerOption interface {
+	apply(*ManagerOptions)
 }
 
-type Options struct {
-	runnerNumber int
-	addr         string
+type ManagerOptions struct {
+	runnerNumber  int
+	addr          string
+	executionTime time.Duration
 }
 
-type funcOptions struct {
-	f func(*Options)
+type funcManagerOptions struct {
+	f func(*ManagerOptions)
 }
 
-func (o *funcOptions) apply(opts *Options) {
+func (o *funcManagerOptions) apply(opts *ManagerOptions) {
 	o.f(opts)
 }
 
-func newFuncOptions(f func(*Options)) *funcOptions {
-	return &funcOptions{f: f}
+func newFuncOptions(f func(*ManagerOptions)) *funcManagerOptions {
+	return &funcManagerOptions{f: f}
 }
 
-func SetRunnersNumber(n int) Option {
-	return newFuncOptions(func(o *Options) {
+func RunnersNumber(n int) ManagerOption {
+	return newFuncOptions(func(o *ManagerOptions) {
 		o.runnerNumber = n
 	})
 }
 
-func SetAddr(addr string) Option {
-	return newFuncOptions(func(o *Options) {
-		o.addr = addr
+func ManagerAddr(a string) ManagerOption {
+	return newFuncOptions(func(o *ManagerOptions) {
+		o.addr = a
 	})
 }
 
-func (m *Manager) Run() {
+func MaxExecutionTime(t time.Duration) ManagerOption {
+	return newFuncOptions(func(o *ManagerOptions) {
+		o.executionTime = t
+	})
+}
+
+func (m *Manager) Serve() {
 	runnerCtx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	for i := 0; i < m.opts.runnerNumber; i++ {
@@ -111,7 +119,9 @@ func (m *Manager) DeleteTask() {
 
 }
 
-func (m *Manager) RegisterHook(h ...BHook) {
+type BHookFunc func() error
+
+func (m *Manager) RegisterHooks(h ...BHookFunc) {
 	m.hooks = append(m.hooks, h...)
 }
 
@@ -123,7 +133,10 @@ func (m *Manager) executeHooks() {
 	}
 }
 
-type Task struct {
+type Job struct {
+	ID            uuid.UUID   `json:"id"`
+	ExecutionTime int64       `json:"executionTime"`
+	Payload       interface{} `json:"payload"`
 }
 
 const (
@@ -132,32 +145,54 @@ const (
 	ClientDisconnected
 )
 
-type Client struct {
+type Session struct {
 	ID       uuid.UUID
 	State    uint32
 	Hostname string
 }
 
-func newClient() *Client {
-	return &Client{
+func newSession() *Session {
+	return &Session{
 		ID:       uuid.New(),
 		State:    ClientWaiting,
 		Hostname: "",
 	}
 }
 
-func (c *Client) getState() uint32 {
+func (c *Session) getState() uint32 {
 	return atomic.LoadUint32(&c.State)
 }
 
-func (c *Client) toWorking() {
+func (c *Session) toWorking() {
 	atomic.StoreUint32(&c.State, ClientWorking)
 }
 
-func (c *Client) toWaiting() {
+func (c *Session) toWaiting() {
 	atomic.StoreUint32(&c.State, ClientWaiting)
 }
 
-func (c *Client) toDisconnected() {
+func (c *Session) toDisconnected() {
 	atomic.StoreUint32(&c.State, ClientDisconnected)
+}
+
+type BClientHandlerFunc func([]byte) error
+
+type Client struct {
+	handlers []BClientHandlerFunc
+}
+
+func NewClient() *Client {
+	return &Client{handlers: []BClientHandlerFunc{}}
+}
+
+func (c *Client) RegisterHandlers(f ...BClientHandlerFunc) {
+	c.handlers = append(c.handlers, f...)
+}
+
+func (c *Client) handle(payload []byte) {
+	for _, c := range c.handlers {
+		if err := c(payload); err != nil {
+			fmt.Printf(err.Error())
+		}
+	}
 }
