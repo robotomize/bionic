@@ -7,4 +7,5 @@ import (
 func main() {
 	m := &bionic.Manager{}
 	_ = m
+
 }
