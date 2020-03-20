@@ -5,22 +5,29 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/opentracing/opentracing-go/log"
+	"net/http"
 	"runtime"
 	"sync"
 )
 
-type Connections struct {
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+type WebsocketSessions struct {
 	registerCh   chan *Conn
 	unregisterCh chan *Conn
 	data         chan []byte
 
 	mu       sync.RWMutex
 	clients  []*Conn
-	sessions map[uuid.UUID]*Session
+	sessions *Sessions
 }
 
-func NewConnections(sessions map[uuid.UUID]*Session) *Connections {
-	return &Connections{
+func NewWebsocketSessions(sessions *Sessions) *WebsocketSessions {
+	return &WebsocketSessions{
 		clients:      []*Conn{},
 		data:         make(chan []byte, 1),
 		sessions:     sessions,
@@ -29,7 +36,7 @@ func NewConnections(sessions map[uuid.UUID]*Session) *Connections {
 	}
 }
 
-func (h *Connections) Serve() {
+func (h *WebsocketSessions) Accept() {
 	go func() {
 		for {
 			select {
@@ -42,7 +49,24 @@ func (h *Connections) Serve() {
 	}()
 }
 
-func (h *Connections) Send(ID uuid.UUID, message []byte) {
+func (h *WebsocketSessions) Serve() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		socket, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			fmt.Printf(err.Error())
+		}
+		client := NewConn(h, socket)
+		h.Register(client)
+		go client.Read()
+		go client.Write()
+	})
+
+	if err := http.ListenAndServe(":9090", nil); err != nil {
+		fmt.Printf(err.Error())
+	}
+}
+
+func (h *WebsocketSessions) Send(ID uuid.UUID, message []byte) {
 	for _, c := range h.clients {
 		if c.ID == ID {
 			c.Send(message)
@@ -50,7 +74,7 @@ func (h *Connections) Send(ID uuid.UUID, message []byte) {
 	}
 }
 
-func (h *Connections) Broadcast(message []byte) {
+func (h *WebsocketSessions) Broadcast(message []byte) {
 	for _, c := range h.GetClients() {
 		if c != nil {
 			c.Send(message)
@@ -58,22 +82,22 @@ func (h *Connections) Broadcast(message []byte) {
 	}
 }
 
-func (h *Connections) onMessage(data []byte) {
+func (h *WebsocketSessions) onMessage(data []byte) {
 	h.data <- data
 }
 
-func (h *Connections) Register(client *Conn) {
+func (h *WebsocketSessions) Register(client *Conn) {
 	h.registerCh <- client
 }
 
-func (h *Connections) onConnect(client *Conn) {
+func (h *WebsocketSessions) onConnect(client *Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients = append(h.clients, client)
-	h.sessions[client.ID] = newSession(client)
+	h.sessions.sessions[client.ID] = newSession(client)
 }
 
-func (h *Connections) onDisconnect(client *Conn) {
+func (h *WebsocketSessions) onDisconnect(client *Conn) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -89,18 +113,18 @@ func (h *Connections) onDisconnect(client *Conn) {
 		h.clients[len(h.clients)-1] = nil
 		h.clients = h.clients[:len(h.clients)-1]
 	}
-	delete(h.sessions, client.ID)
+	delete(h.sessions.sessions, client.ID)
 	client.Close()
 }
 
-func (h *Connections) GetClients() []*Conn {
+func (h *WebsocketSessions) GetClients() []*Conn {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.clients
 }
 
 type Conn struct {
-	Connections *Connections
+	Connections *WebsocketSessions
 	Socket      *websocket.Conn
 	mu          sync.RWMutex
 	ID          uuid.UUID
@@ -111,15 +135,14 @@ type Conn struct {
 	handlePanic bool
 }
 
-func NewConn(hub *Connections, socket *websocket.Conn, handlePanic bool) *Conn {
+func NewConn(websocketSessions *WebsocketSessions, socket *websocket.Conn) *Conn {
 	return &Conn{
 		ID:          uuid.New(),
-		Connections: hub,
+		Connections: websocketSessions,
 		Socket:      socket,
 		outbound:    make(chan []byte),
 		doneCh:      make(chan struct{}),
 		closed:      false,
-		handlePanic: handlePanic,
 	}
 }
 

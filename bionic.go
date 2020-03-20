@@ -14,8 +14,12 @@ import (
 const DefaultAddr = 53300
 
 func New() {
-	m := NewManager(RunnersNumber(1), MaxExecutionTime(30*time.Second))
-	m.Serve()
+	manager := NewManager(RunnersNumber(1), MaxExecutionTime(30*time.Second))
+	sessions := manager.GetSessions()
+	websocketSessions := NewWebsocketSessions(sessions)
+	websocketSessions.Accept()
+	websocketSessions.Serve()
+	manager.Serve()
 }
 
 const (
@@ -29,7 +33,7 @@ var defaultOptions = ManagerOptions{
 }
 
 type Manager struct {
-	ws    *Connections
+	ws    *WebsocketSessions
 	httpd http.Server
 
 	hooks  map[string][]BHookFunc
@@ -39,7 +43,7 @@ type Manager struct {
 
 	cMu sync.RWMutex
 
-	sessions     map[uuid.UUID]*Session
+	sessions     *Sessions
 	sessionTasks map[uuid.UUID][]*Session
 }
 
@@ -54,9 +58,8 @@ func NewManager(opt ...ManagerOption) *Manager {
 		opts:     opts,
 		cancel:   nil,
 		cMu:      sync.RWMutex{},
-		sessions: map[uuid.UUID]*Session{},
+		sessions: &Sessions{sessions: map[uuid.UUID]*Session{}},
 	}
-	m.ws = NewConnections(m.sessions)
 	return m
 }
 
@@ -144,6 +147,10 @@ func (m *Manager) DeleteTask() {
 
 }
 
+func (m *Manager) GetSessions() *Sessions {
+	return m.sessions
+}
+
 type BHookFunc func([]byte) error
 
 func (m *Manager) RegisterHooks(kind string, h ...BHookFunc) {
@@ -180,32 +187,41 @@ const (
 	ClientDisconnected
 )
 
+type Sessions struct {
+	mu       sync.RWMutex
+	sessions map[uuid.UUID]*Session
+}
+
 type Session struct {
-	ID    uuid.UUID
-	State uint32
-	Conn  *Conn
+	ID     uuid.UUID
+	Status uint32
+	Conn   *Conn
+}
+
+func (s *Session) checkConn() {
+	s.Conn.Send()
 }
 
 func newSession(conn *Conn) *Session {
 	return &Session{
-		ID:    uuid.New(),
-		State: ClientWaiting,
-		Conn:  conn,
+		ID:     uuid.New(),
+		Status: ClientWaiting,
+		Conn:   conn,
 	}
 }
 
-func (c *Session) getState() uint32 {
-	return atomic.LoadUint32(&c.State)
+func (s *Session) getStatus() uint32 {
+	return atomic.LoadUint32(&s.Status)
 }
 
-func (c *Session) toWorking() {
-	atomic.StoreUint32(&c.State, ClientWorking)
+func (s *Session) toWorking() {
+	atomic.StoreUint32(&s.Status, ClientWorking)
 }
 
-func (c *Session) toWaiting() {
-	atomic.StoreUint32(&c.State, ClientWaiting)
+func (s *Session) toWaiting() {
+	atomic.StoreUint32(&s.Status, ClientWaiting)
 }
 
-func (c *Session) toDisconnected() {
-	atomic.StoreUint32(&c.State, ClientDisconnected)
+func (s *Session) toDisconnected() {
+	atomic.StoreUint32(&s.Status, ClientDisconnected)
 }
