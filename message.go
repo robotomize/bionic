@@ -8,10 +8,10 @@ type Proto struct {
 }
 
 const (
-	pingKind uint8 = iota
-	pongKind
-	newJob
-	jobCompleted
+	PingKind uint8 = iota
+	PongKind
+	NewJobKind
+	JobCompletedKind
 )
 
 type PingMessage struct {

@@ -61,9 +61,11 @@ func (h *WebsocketSessions) Serve() {
 		go client.Write()
 	})
 
-	if err := http.ListenAndServe(":9090", nil); err != nil {
-		fmt.Printf(err.Error())
-	}
+	go func() {
+		if err := http.ListenAndServe(":9090", nil); err != nil {
+			fmt.Printf(err.Error())
+		}
+	}()
 }
 
 func (h *WebsocketSessions) Send(ID uuid.UUID, message []byte) {

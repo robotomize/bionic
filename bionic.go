@@ -11,15 +11,14 @@ import (
 	"time"
 )
 
-const DefaultAddr = 53300
-
-func New() {
+func New() *Manager {
 	manager := NewManager(RunnersNumber(1), MaxExecutionTime(30*time.Second))
 	sessions := manager.GetSessions()
 	websocketSessions := NewWebsocketSessions(sessions)
 	websocketSessions.Accept()
 	websocketSessions.Serve()
-	manager.Serve()
+
+	return manager
 }
 
 const (
@@ -36,13 +35,14 @@ type Manager struct {
 	ws    *WebsocketSessions
 	httpd http.Server
 
-	hooks  map[string][]BHookFunc
-	taskCh chan interface{}
+	hooks map[string][]HookFunc
+
 	opts   ManagerOptions
 	cancel func()
 
 	cMu sync.RWMutex
 
+	jobs         []Job
 	sessions     *Sessions
 	sessionTasks map[uuid.UUID][]*Session
 }
@@ -53,8 +53,7 @@ func NewManager(opt ...ManagerOption) *Manager {
 		o.apply(&opts)
 	}
 	m := &Manager{
-		hooks:    map[string][]BHookFunc{},
-		taskCh:   make(chan interface{}, 1),
+		hooks:    map[string][]HookFunc{},
 		opts:     opts,
 		cancel:   nil,
 		cMu:      sync.RWMutex{},
@@ -98,11 +97,6 @@ func MaxExecutionTime(t time.Duration) ManagerOption {
 }
 
 func (m *Manager) Serve() {
-	runnerCtx, cancel := context.WithCancel(context.Background())
-	m.cancel = cancel
-	for i := 0; i < m.opts.runnerNumber; i++ {
-		m.runner(runnerCtx)
-	}
 }
 
 func (m *Manager) Stop() {
@@ -126,24 +120,11 @@ func (m *Manager) incoming(ctx context.Context) {
 	}()
 }
 
-func (m *Manager) runner(ctx context.Context) {
-	go func() {
-		for {
-			select {
-			case t := <-m.taskCh:
-				_ = t
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+func (m *Manager) AddJob(j Job) {
+	m.AddJob(j)
 }
 
-func (m *Manager) AddTask(t interface{}) {
-
-}
-
-func (m *Manager) DeleteTask() {
+func (m *Manager) DeleteJob() {
 
 }
 
@@ -151,9 +132,9 @@ func (m *Manager) GetSessions() *Sessions {
 	return m.sessions
 }
 
-type BHookFunc func([]byte) error
+type HookFunc func([]byte) error
 
-func (m *Manager) RegisterHooks(kind string, h ...BHookFunc) {
+func (m *Manager) RegisterHooks(kind string, h ...HookFunc) {
 	m.hooks[kind] = append(m.hooks[kind], h...)
 }
 
@@ -198,8 +179,13 @@ type Session struct {
 	Conn   *Conn
 }
 
-func (s *Session) checkConn() {
-	s.Conn.Send()
+func (s *Session) ping() {
+	var d *PingMessage
+	bytes, err := json.Marshal(&d)
+	if err != nil {
+		fmt.Printf(err.Error())
+	}
+	s.Conn.Send(bytes)
 }
 
 func newSession(conn *Conn) *Session {

@@ -1,18 +1,18 @@
-package goclient
+package gobionic
 
 import "fmt"
 
-type BClientHandlerFunc func([]byte) error
+type HandlerFunc func([]byte) error
 
 type Client struct {
-	handlers []BClientHandlerFunc
+	handlers []HandlerFunc
 }
 
 func NewClient() *Client {
-	return &Client{handlers: []BClientHandlerFunc{}}
+	return &Client{handlers: []HandlerFunc{}}
 }
 
-func (c *Client) RegisterHandlers(f ...BClientHandlerFunc) {
+func (c *Client) RegisterHandlers(f ...HandlerFunc) {
 	c.handlers = append(c.handlers, f...)
 }
 
