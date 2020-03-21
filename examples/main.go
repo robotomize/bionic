@@ -1,10 +1,5 @@
 package main
 
-import (
-	"bionic"
-	"bionic/clients/gobionic"
-)
-
 func Add(bytes []byte) error {
 	//kind := uint8(gjson.GetBytes(bytes, "proto.kind").Int())
 	//switch kind {
@@ -12,12 +7,14 @@ func Add(bytes []byte) error {
 	//
 	//case bionic.NewJobKind:
 	//}
+	return nil
 }
 
 func main() {
-	server := bionic.New()
-	_ = server
-	client := gobionic.NewClient()
 
-	client.RegisterHandlers(Add)
+	//server := bionic.New()
+	//_ = server
+	//client := bionic.NewClient()
+	//
+	//client.RegisterHandlers(Add)
 }

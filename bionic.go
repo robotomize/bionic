@@ -3,21 +3,18 @@ package bionic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/opentracing/opentracing-go/log"
+	"github.com/tidwall/gjson"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 func New() *Manager {
-	manager := NewManager(RunnersNumber(1), MaxExecutionTime(30*time.Second))
-	sessions := manager.GetSessions()
-	websocketSessions := NewWebsocketSessions(sessions)
-	websocketSessions.Accept()
-	websocketSessions.Serve()
-
+	manager := NewManager(MaxExecutionTime(30 * time.Second))
 	return manager
 }
 
@@ -32,9 +29,6 @@ var defaultOptions = ManagerOptions{
 }
 
 type Manager struct {
-	ws    *WebsocketSessions
-	httpd http.Server
-
 	hooks map[string][]HookFunc
 
 	opts   ManagerOptions
@@ -42,6 +36,7 @@ type Manager struct {
 
 	cMu sync.RWMutex
 
+	finCh        chan Job
 	jobs         []Job
 	sessions     *Sessions
 	sessionTasks map[uuid.UUID][]*Session
@@ -56,10 +51,40 @@ func NewManager(opt ...ManagerOption) *Manager {
 		hooks:    map[string][]HookFunc{},
 		opts:     opts,
 		cancel:   nil,
+		finCh:    make(chan Job),
 		cMu:      sync.RWMutex{},
 		sessions: &Sessions{sessions: map[uuid.UUID]*Session{}},
 	}
 	return m
+}
+
+func (m *Manager) Serve() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		socket, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			fmt.Printf(err.Error())
+		}
+		conn := NewConn(socket)
+		session := newSession()
+		session.readCh = conn.wrCh
+		session.finCh = m.finCh
+		go conn.Read()
+	})
+
+	go func() {
+		if err := http.ListenAndServe(":9090", nil); err != nil {
+			fmt.Printf(err.Error())
+		}
+	}()
+}
+
+func (m *Manager) getAll() []Job {
+	var jobs []Job
+	jobs = append(jobs, m.jobs...)
+	for _, j := range m.sessions.sessions {
+		jobs = append(jobs, j.jobs...)
+	}
+	return jobs
 }
 
 type ManagerOption interface {
@@ -84,35 +109,22 @@ func newFuncOptions(f func(*ManagerOptions)) *funcManagerOptions {
 	return &funcManagerOptions{f: f}
 }
 
-func RunnersNumber(n int) ManagerOption {
-	return newFuncOptions(func(o *ManagerOptions) {
-		o.runnerNumber = n
-	})
-}
-
 func MaxExecutionTime(t time.Duration) ManagerOption {
 	return newFuncOptions(func(o *ManagerOptions) {
 		o.executionTime = t
 	})
 }
 
-func (m *Manager) Serve() {
-}
-
 func (m *Manager) Stop() {
 	m.cancel()
 }
 
-func (m *Manager) incoming(ctx context.Context) {
+func (m *Manager) handling(ctx context.Context) {
 	go func() {
-		var job Job
 		for {
 			select {
-			case data := <-m.ws.data:
-				if err := json.Unmarshal(data, &job); err != nil {
-					fmt.Printf(err.Error())
-				}
-				m.executeHooks(job.Kind, data)
+			case job := <-m.finCh:
+				m.executeHooks(job.Kind, job.PayloadResponse)
 			case <-ctx.Done():
 				return
 			}
@@ -134,8 +146,8 @@ func (m *Manager) GetSessions() *Sessions {
 
 type HookFunc func([]byte) error
 
-func (m *Manager) RegisterHooks(kind string, h ...HookFunc) {
-	m.hooks[kind] = append(m.hooks[kind], h...)
+func (m *Manager) RegisterHook(kind string, h HookFunc) {
+	m.hooks[kind] = append(m.hooks[kind], h)
 }
 
 func (m *Manager) executeHooks(kind string, payload []byte) {
@@ -146,26 +158,46 @@ func (m *Manager) executeHooks(kind string, payload []byte) {
 	}
 }
 
-type Job struct {
-	ID            uuid.UUID   `json:"id"`
-	Kind          string      `json:"name"`
-	ExecutionTime int64       `json:"executionTime"`
-	Payload       interface{} `json:"payload"`
+const (
+	JobStatusWaiting uint8 = iota
+	JobStatusWorking
+	JobStatusFinished
+)
+
+type JobTrace struct {
+	sessionID uuid.UUID
+	status    uint8
+	timestamp int64
 }
 
-func NewJob(kind string, payload interface{}, execTime int64) Job {
+func NewJobTrace(sessionID uuid.UUID, status uint8) JobTrace {
+	return JobTrace{sessionID: sessionID, status: status}
+}
+
+type Job struct {
+	ID              uuid.UUID
+	Status          uint32
+	Kind            string
+	ExecutionTime   int64
+	Trace           []JobTrace
+	PayloadRequest  []byte
+	PayloadResponse []byte
+}
+
+func NewJob(kind string, reqPayload []byte, execTime int64) Job {
 	return Job{
-		ID:            uuid.New(),
-		Kind:          kind,
-		ExecutionTime: execTime,
-		Payload:       payload,
+		ID:             uuid.New(),
+		Kind:           kind,
+		ExecutionTime:  execTime,
+		PayloadRequest: reqPayload,
 	}
 }
 
 const (
-	ClientWorking uint32 = iota
-	ClientWaiting
-	ClientDisconnected
+	SessionStatusWorking uint8 = iota
+	SessionStatusWaiting
+	SessionStatusDisconnected
+	SessionStatusLocked
 )
 
 type Sessions struct {
@@ -173,41 +205,162 @@ type Sessions struct {
 	sessions map[uuid.UUID]*Session
 }
 
+const (
+	maxConnIncr      = 300
+	criticalConnIncr = 600
+	updateTimeValue  = 10
+)
+
 type Session struct {
-	ID     uuid.UUID
-	Status uint32
-	Conn   *Conn
+	ID       uuid.UUID
+	mu       sync.RWMutex
+	jobs     []Job
+	closeCh  chan uuid.UUID
+	finCh    chan Job
+	readCh   chan []byte
+	Status   uint8
+	connIncr int
+	Conn     *Conn
 }
 
-func (s *Session) ping() {
-	var d *PingMessage
-	bytes, err := json.Marshal(&d)
+func (s *Session) start() {
+
+}
+
+func (s *Session) stop() {
+
+}
+
+func (s *Session) addJob(job Job) {
+	s.jobs = append(s.jobs, job)
+}
+
+func (s *Session) connIncrTimer(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(updateTimeValue * time.Second)
+		for {
+			select {
+			case <-t.C:
+				s.connIncr += updateTimeValue
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (s *Session) resetConnIncr() {
+	s.connIncr = 0
+}
+
+func (s *Session) checkConnIncr() {
+	if s.connIncr >= criticalConnIncr {
+		// close connection
+	}
+	if s.connIncr > maxConnIncr && s.connIncr < criticalConnIncr {
+		s.pushPing()
+	}
+}
+
+func (s *Session) read(ctx context.Context) {
+	go func() {
+		var j *JobMessage
+		for {
+			select {
+			case bytes := <-s.readCh:
+				kind := uint8(gjson.GetBytes(bytes, "proto.kind").Int())
+				switch kind {
+				case PongKind:
+					s.resetConnIncr()
+				case JobCompletedKind:
+					if err := json.Unmarshal(bytes, &j); err != nil {
+						log.Error(err)
+					}
+					for _, job := range s.jobs {
+						if job.ID == j.Job.ID {
+							result := gjson.GetBytes(bytes, "job.payload").Raw
+							job.PayloadResponse = []byte(result)
+							job.Trace = append(job.Trace, NewJobTrace(s.ID, JobStatusFinished))
+							s.finCh <- job
+						}
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (s *Session) pushPing() {
+	m := &PingMessage{Proto: Proto{SessionID: s.ID, Kind: PingKind}}
+	bytes, err := json.Marshal(&m)
 	if err != nil {
 		fmt.Printf(err.Error())
 	}
-	s.Conn.Send(bytes)
-}
+	if err := s.writeRetry(3, bytes); err != nil {
 
-func newSession(conn *Conn) *Session {
-	return &Session{
-		ID:     uuid.New(),
-		Status: ClientWaiting,
-		Conn:   conn,
 	}
 }
 
-func (s *Session) getStatus() uint32 {
-	return atomic.LoadUint32(&s.Status)
+func (s *Session) pushJob(j *Job) {
+	m := &JobMessage{
+		Job: struct {
+			ID      uuid.UUID   `json:"id"`
+			Kind    string      `json:"kind"`
+			Payload interface{} `json:"payload"`
+		}{
+			ID:      j.ID,
+			Kind:    j.Kind,
+			Payload: j.PayloadResponse,
+		},
+		Proto: Proto{
+			SessionID: s.ID,
+			Kind:      NewJobKind,
+		},
+	}
+	bytes, err := json.Marshal(&m)
+	if err != nil {
+		fmt.Printf(err.Error())
+	}
+	if err := s.writeRetry(3, bytes); err != nil {
+
+	}
+}
+
+func (s *Session) writeRetry(n int, bytes []byte) error {
+	for i := 0; i < n; i++ {
+		err := s.Conn.Write(bytes)
+		if err == nil {
+			return nil
+		}
+	}
+	return errors.New("")
+}
+
+func newSession() *Session {
+	return &Session{
+		ID:       uuid.New(),
+		Status:   SessionStatusWaiting,
+		readCh:   make(chan []byte, 1),
+		finCh:    make(chan Job, 1),
+		jobs:     []Job{},
+		connIncr: 0,
+	}
 }
 
 func (s *Session) toWorking() {
-	atomic.StoreUint32(&s.Status, ClientWorking)
+	s.Status = SessionStatusWorking
 }
 
 func (s *Session) toWaiting() {
-	atomic.StoreUint32(&s.Status, ClientWaiting)
+	s.Status = SessionStatusWaiting
 }
 
 func (s *Session) toDisconnected() {
-	atomic.StoreUint32(&s.Status, ClientDisconnected)
+	s.Status = SessionStatusDisconnected
+}
+
+func (s *Session) toLocked() {
+	s.Status = SessionStatusLocked
 }

@@ -2,11 +2,6 @@ package bionic
 
 import "github.com/google/uuid"
 
-type Proto struct {
-	ID   uuid.UUID `json:"id"`
-	Kind uint8     `json:"kind"`
-}
-
 const (
 	PingKind uint8 = iota
 	PongKind
@@ -14,11 +9,20 @@ const (
 	JobCompletedKind
 )
 
+type Proto struct {
+	SessionID uuid.UUID `json:"sessionId"`
+	Kind      uint8     `json:"kind"`
+}
+
 type PingMessage struct {
 	Proto Proto `json:"proto"`
 }
 
 type JobMessage struct {
+	Job struct {
+		ID      uuid.UUID   `json:"id"`
+		Kind    string      `json:"kind"`
+		Payload interface{} `json:"payload"`
+	} `json:"job"`
 	Proto Proto `json:"proto"`
-	Job   Job   `json:"job"`
 }
