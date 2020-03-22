@@ -10,6 +10,7 @@ import (
 	"github.com/valyala/fastrand"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,11 +40,12 @@ var defaultOptions = ManagerOptions{
 type Dispatcher struct {
 	mu       sync.RWMutex
 	jobs     map[uuid.UUID]*Job
-	sessions []*Session
+	sessions map[uuid.UUID]*Session
 	hooks    map[string][]HookFunc
 
-	finCh   chan uuid.UUID
-	eventCh chan struct{}
+	finCh chan uuid.UUID
+	evCh  chan struct{}
+	clCh  chan uuid.UUID
 
 	opts   ManagerOptions
 	cancel func()
@@ -59,9 +61,10 @@ func NewDispatcher(opt ...ManagerOption) *Dispatcher {
 		opts:     opts,
 		cancel:   nil,
 		finCh:    make(chan uuid.UUID, 1),
-		sessions: []*Session{},
+		clCh:     make(chan uuid.UUID, 1),
+		sessions: map[uuid.UUID]*Session{},
 		jobs:     map[uuid.UUID]*Job{},
-		eventCh:  make(chan struct{}, 1),
+		evCh:     make(chan struct{}, 1),
 	}
 	return m
 }
@@ -81,10 +84,11 @@ func (m *Dispatcher) Serve() {
 		conn := NewConn(socket)
 		session := newSession(conn)
 		session.finCh = m.finCh
+		session.clCh = m.clCh
 		session.start()
 
-		m.sessions = append(m.sessions, session)
-		m.eventCh <- struct{}{}
+		m.sessions[session.ID] = session
+		m.evCh <- struct{}{}
 	})
 
 	go func() {
@@ -134,16 +138,28 @@ func (m *Dispatcher) handling(ctx context.Context) {
 		for {
 			select {
 			case id := <-m.finCh:
-				m.mu.RLock()
-				job := m.jobs[id]
-				m.mu.RUnlock()
-				m.execHooks(job.Kind, job.BodyResponse)
-				job.mu.Lock()
-				job.toDeleted()
-				job.Trace = append(job.Trace, NewJobTrace([16]byte{}, JobStatusDeleted, nil))
-				job.mu.Unlock()
-			case <-m.eventCh:
-				m.schedule()
+				go func() {
+					m.mu.RLock()
+					job := m.jobs[id]
+					m.mu.RUnlock()
+					m.execHooks(job.Kind, job.BodyResponse)
+					job.mu.Lock()
+					job.toDeleted()
+					job.Trace = append(job.Trace, NewJobTrace([16]byte{}, JobStatusDeleted, nil))
+					job.mu.Unlock()
+					m.mu.Lock()
+					delete(m.jobs, job.ID)
+					m.mu.Unlock()
+				}()
+			case id := <-m.clCh:
+				go func() {
+					m.mu.Lock()
+					m.sessions[id].stop()
+					delete(m.sessions, id)
+					m.mu.Unlock()
+				}()
+			case <-m.evCh:
+				go m.schedule()
 			case <-ctx.Done():
 				return
 			}
@@ -156,8 +172,13 @@ func (m *Dispatcher) schedule() {
 	defer m.mu.Unlock()
 	for _, job := range m.jobs {
 		if job.isWaiting() && len(m.sessions) > 0 {
-			n := fastrand.Uint32n(uint32(len(m.sessions) - 1))
-			m.sessions[n].addJob(job)
+			n := int(fastrand.Uint32n(uint32(len(m.sessions) - 1)))
+			k := 0
+			for _, s := range m.sessions {
+				if k == n {
+					s.addJob(job)
+				}
+			}
 		}
 	}
 }
@@ -170,7 +191,7 @@ func (m *Dispatcher) AddJob(j *Job) {
 	m.mu.Lock()
 	m.jobs[j.ID] = j
 	m.mu.Unlock()
-	m.eventCh <- struct{}{}
+	m.evCh <- struct{}{}
 }
 
 func (m *Dispatcher) CancelJob(ID uuid.UUID) {
@@ -297,15 +318,26 @@ type Session struct {
 	Status   uint32
 	connIncr uint32
 
-	evCh    chan struct{}
-	finCh   chan uuid.UUID
-	closeCh chan uuid.UUID
+	evCh  chan struct{}
+	finCh chan uuid.UUID
+	clCh  chan uuid.UUID
 
 	mu   sync.RWMutex
-	jobs []*Job
+	jobs map[uuid.UUID]*Job
 	Conn *Conn
 
 	cancel func()
+}
+
+func newSession(conn *Conn) *Session {
+	return &Session{
+		ID:       uuid.New(),
+		Status:   SessionStatusWaiting,
+		evCh:     make(chan struct{}, 1),
+		jobs:     map[uuid.UUID]*Job{},
+		connIncr: 0,
+		Conn:     conn,
+	}
 }
 
 func (s *Session) start() {
@@ -316,14 +348,16 @@ func (s *Session) start() {
 }
 
 func (s *Session) stop() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	s.cancel()
-	s.Conn.Close()
+	close(s.evCh)
 }
 
 func (s *Session) addJob(job *Job) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.jobs = append(s.jobs, job)
+	s.jobs[job.ID] = job
 	for _, j := range s.jobs {
 		if j.isWaiting() {
 			if err := s.sendJob(j); err != nil {
@@ -373,6 +407,8 @@ func (s *Session) read(ctx context.Context) {
 			select {
 			case bytes := <-s.Conn.Read():
 				s.handleIncoming(bytes)
+			case <-s.Conn.clCh:
+				s.clCh <- s.ID
 			case <-ctx.Done():
 				return
 			}
@@ -381,8 +417,8 @@ func (s *Session) read(ctx context.Context) {
 }
 
 func (s *Session) handleIncoming(bytes []byte) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var j *JobMessage // @TODO candidate for syn.pool
 	kind := uint8(gjson.GetBytes(bytes, "proto.kind").Int())
 	switch kind {
@@ -400,6 +436,7 @@ func (s *Session) handleIncoming(bytes []byte) {
 				job.toFinished()
 				job.Trace = append(job.Trace, NewJobTrace(s.ID, JobStatusFinished, s.Conn.Socket.RemoteAddr()))
 				job.mu.Unlock()
+				delete(s.jobs, job.ID)
 				s.finCh <- job.ID
 			}
 		}
@@ -442,18 +479,6 @@ func (s *Session) sendJob(j *Job) error {
 		return err
 	}
 	return nil
-}
-
-func newSession(conn *Conn) *Session {
-	return &Session{
-		ID:       uuid.New(),
-		Status:   SessionStatusWaiting,
-		finCh:    make(chan uuid.UUID, 1),
-		evCh:     make(chan struct{}, 1),
-		jobs:     []*Job{},
-		connIncr: 0,
-		Conn:     conn,
-	}
 }
 
 func (s *Session) isWorking() bool {

@@ -105,6 +105,6 @@ func main() {
 		}
 
 		b.AddJob(bionic.NewJob("pi", payload, 30))
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 }

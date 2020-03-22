@@ -8,12 +8,14 @@ import (
 type Conn struct {
 	Socket *websocket.Conn
 	wrCh   chan []byte
+	clCh   chan struct{}
 }
 
 func NewConn(socket *websocket.Conn) *Conn {
 	c := &Conn{
 		Socket: socket,
 		wrCh:   make(chan []byte, 1),
+		clCh:   make(chan struct{}, 1),
 	}
 	c.read()
 	return c
@@ -29,6 +31,7 @@ func (c *Conn) read() {
 			_, data, err := c.Socket.ReadMessage()
 			if err != nil {
 				log.Error(err)
+				c.clCh <- struct{}{}
 				return
 			}
 			c.wrCh <- data
@@ -44,4 +47,5 @@ func (c *Conn) Close() {
 	if err := c.Socket.Close(); err != nil {
 		log.Error(err)
 	}
+	c.clCh <- struct{}{}
 }
