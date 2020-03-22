@@ -1,4 +1,4 @@
-module bionic
+module github.com/robotomize/bionic
 
 go 1.13
 
