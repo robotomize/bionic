@@ -130,7 +130,7 @@ func (m *Manager) handling(ctx context.Context) {
 			select {
 			case id := <-m.finCh:
 				job := m.jobs[id]
-				m.executeHooks(job.Kind, job.PayloadResponse)
+				m.execHooks(job.Kind, job.PayloadResponse)
 				job.Status = JobStatusDeleted
 				job.Trace = append(job.Trace, NewJobTrace([16]byte{}, JobStatusDeleted, nil))
 			case <-m.eventCh:
@@ -168,11 +168,11 @@ func (m *Manager) GetSessions() []*Session {
 
 type HookFunc func([]byte) error
 
-func (m *Manager) Register(kind string, h ...HookFunc) {
+func (m *Manager) AddHook(kind string, h ...HookFunc) {
 	m.hooks[kind] = append(m.hooks[kind], h...)
 }
 
-func (m *Manager) executeHooks(kind string, payload []byte) {
+func (m *Manager) execHooks(kind string, payload []byte) {
 	if _, ok := m.hooks[kind]; ok {
 		for _, h := range m.hooks[kind] {
 			if err := h(payload); err != nil {
@@ -221,8 +221,8 @@ func NewJob(kind string, reqPayload []byte, execTime int64) *Job {
 }
 
 const (
-	SessionStatusWorking uint8 = iota
-	SessionStatusWaiting
+	SessionStatusWaiting uint8 = iota
+	SessionStatusWorking
 	SessionStatusDisconnected
 	SessionStatusLocked
 )

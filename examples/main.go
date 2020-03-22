@@ -41,7 +41,7 @@ type PiJobResp struct {
 
 func NewServer() *bionic.Manager {
 	b := bionic.New()
-	b.Register("pi", func(bytes []byte) error {
+	b.AddHook("pi", func(bytes []byte) error {
 		file, openErr := os.OpenFile("./examples/response.json", os.O_RDWR|os.O_APPEND|os.O_CREATE, os.FileMode(0755))
 		if openErr != nil {
 			fmt.Printf(openErr.Error())
