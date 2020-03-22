@@ -41,7 +41,7 @@ type PiJobResp struct {
 func NewServer() *bionic.Dispatcher {
 	b := bionic.New()
 	b.AddHook("pi", func(bytes []byte) error {
-		file, openErr := os.OpenFile("./examples/response.json", os.O_RDWR|os.O_APPEND|os.O_CREATE, os.FileMode(0755))
+		file, openErr := os.OpenFile("./response.json", os.O_RDWR|os.O_APPEND|os.O_CREATE, os.FileMode(0755))
 		if openErr != nil {
 			fmt.Printf(openErr.Error())
 		}
@@ -50,9 +50,9 @@ func NewServer() *bionic.Dispatcher {
 				fmt.Printf(err.Error())
 			}
 		}()
-		if _, err := fmt.Fprint(file, string(bytes)+"\n"); err != nil {
-			fmt.Printf(err.Error())
-		}
+		//if _, err := fmt.Fprint(file, string(bytes)+"\n"); err != nil {
+		//	fmt.Printf(err.Error())
+		//}
 		// send to file
 		return nil
 	}, func(bytes []byte) error {
@@ -105,6 +105,6 @@ func main() {
 		}
 
 		b.AddJob(bionic.NewJob("pi", payload, 30))
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }

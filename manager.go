@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/opentracing/opentracing-go/log"
 	"github.com/tidwall/gjson"
 	"github.com/valyala/fastrand"
 	"net"
@@ -38,17 +37,16 @@ var defaultOptions = ManagerOptions{
 }
 
 type Dispatcher struct {
-	hooks map[string][]HookFunc
-
-	opts   ManagerOptions
-	cancel func()
+	mu       sync.RWMutex
+	jobs     map[uuid.UUID]*Job
+	sessions []*Session
+	hooks    map[string][]HookFunc
 
 	finCh   chan uuid.UUID
 	eventCh chan struct{}
 
-	mu       sync.RWMutex
-	jobs     map[uuid.UUID]*Job
-	sessions []*Session
+	opts   ManagerOptions
+	cancel func()
 }
 
 func NewDispatcher(opt ...ManagerOption) *Dispatcher {
@@ -73,6 +71,8 @@ func (m *Dispatcher) Serve() {
 	m.cancel = cancel
 	m.handling(ctx)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
 		socket, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			fmt.Printf(err.Error())
@@ -82,6 +82,7 @@ func (m *Dispatcher) Serve() {
 		session := newSession(conn)
 		session.finCh = m.finCh
 		session.start()
+
 		m.sessions = append(m.sessions, session)
 		m.eventCh <- struct{}{}
 	})
@@ -133,10 +134,14 @@ func (m *Dispatcher) handling(ctx context.Context) {
 		for {
 			select {
 			case id := <-m.finCh:
+				m.mu.RLock()
 				job := m.jobs[id]
+				m.mu.RUnlock()
 				m.execHooks(job.Kind, job.BodyResponse)
-				job.Status = JobStatusDeleted
+				job.mu.Lock()
+				job.toDeleted()
 				job.Trace = append(job.Trace, NewJobTrace([16]byte{}, JobStatusDeleted, nil))
+				job.mu.Unlock()
 			case <-m.eventCh:
 				m.schedule()
 			case <-ctx.Done():
@@ -147,8 +152,10 @@ func (m *Dispatcher) handling(ctx context.Context) {
 }
 
 func (m *Dispatcher) schedule() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, job := range m.jobs {
-		if job.Status == JobStatusWaiting && len(m.sessions) > 0 {
+		if job.isWaiting() && len(m.sessions) > 0 {
 			n := fastrand.Uint32n(uint32(len(m.sessions) - 1))
 			m.sessions[n].addJob(job)
 		}
@@ -156,9 +163,13 @@ func (m *Dispatcher) schedule() {
 }
 
 func (m *Dispatcher) AddJob(j *Job) {
-	j.Status = JobStatusWaiting
+	j.mu.Lock()
+	j.toWaiting()
 	j.Trace = append(j.Trace, NewJobTrace([16]byte{}, JobStatusWaiting, nil))
+	j.mu.Unlock()
+	m.mu.Lock()
 	m.jobs[j.ID] = j
+	m.mu.Unlock()
 	m.eventCh <- struct{}{}
 }
 
@@ -169,10 +180,14 @@ func (m *Dispatcher) CancelJob(ID uuid.UUID) {
 type HookFunc func([]byte) error
 
 func (m *Dispatcher) AddHook(kind string, h ...HookFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.hooks[kind] = append(m.hooks[kind], h...)
 }
 
 func (m *Dispatcher) execHooks(kind string, payload []byte) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if _, ok := m.hooks[kind]; ok {
 		for _, h := range m.hooks[kind] {
 			if err := h(payload); err != nil {
@@ -306,12 +321,19 @@ func (s *Session) stop() {
 }
 
 func (s *Session) addJob(job *Job) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.jobs = append(s.jobs, job)
 	for _, j := range s.jobs {
-		if j.Status == JobStatusWaiting {
-			s.sendJob(j)
-			j.Status = JobStatusWorking
+		if j.isWaiting() {
+			if err := s.sendJob(j); err != nil {
+				fmt.Printf(err.Error())
+				return
+			}
+			j.toWorking()
+			j.mu.Lock()
 			j.Trace = append(j.Trace, NewJobTrace(s.ID, JobStatusWorking, s.Conn.Socket.RemoteAddr()))
+			j.mu.Unlock()
 		}
 	}
 }
@@ -331,41 +353,26 @@ func (s *Session) connIncrTimer(ctx context.Context) {
 }
 
 func (s *Session) resetConnIncr() {
-	s.connIncr = 0
+	atomic.StoreUint32(&s.connIncr, 0)
 }
 
 func (s *Session) checkConnIncr() {
-	if s.connIncr >= criticalConnIncr {
+	if atomic.LoadUint32(&s.connIncr) >= criticalConnIncr {
 		// close connection
 	}
-	if s.connIncr > maxConnIncr && s.connIncr < criticalConnIncr {
-		s.sendPing()
+	if atomic.LoadUint32(&s.connIncr) > maxConnIncr && atomic.LoadUint32(&s.connIncr) < criticalConnIncr {
+		if err := s.sendPing(); err != nil {
+			fmt.Printf(err.Error())
+		}
 	}
 }
 
 func (s *Session) read(ctx context.Context) {
 	go func() {
-		var j *JobMessage
 		for {
 			select {
 			case bytes := <-s.Conn.Read():
-				kind := uint8(gjson.GetBytes(bytes, "proto.kind").Int())
-				switch kind {
-				case PongMessageKind:
-					s.resetConnIncr()
-				case JobCompletedMessageKind:
-					if err := json.Unmarshal(bytes, &j); err != nil {
-						log.Error(err)
-					}
-					for _, job := range s.jobs {
-						if job.ID == j.Job.ID {
-							job.BodyResponse = j.Job.Body
-							job.Status = JobStatusFinished
-							job.Trace = append(job.Trace, NewJobTrace(s.ID, JobStatusFinished, s.Conn.Socket.RemoteAddr()))
-							s.finCh <- job.ID
-						}
-					}
-				}
+				s.handleIncoming(bytes)
 			case <-ctx.Done():
 				return
 			}
@@ -373,18 +380,45 @@ func (s *Session) read(ctx context.Context) {
 	}()
 }
 
-func (s *Session) sendPing() {
-	m := &PingMessage{Proto: Proto{SessionID: s.ID, Kind: PingMessageKind}}
-	bytes, err := json.Marshal(&m)
-	if err != nil {
-		fmt.Printf(err.Error())
-	}
-	if err := s.Conn.Write(bytes); err != nil {
-		fmt.Printf(err.Error())
+func (s *Session) handleIncoming(bytes []byte) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var j *JobMessage // @TODO candidate for syn.pool
+	kind := uint8(gjson.GetBytes(bytes, "proto.kind").Int())
+	switch kind {
+	case PongMessageKind:
+		s.resetConnIncr()
+	case JobCompletedMessageKind:
+		if err := json.Unmarshal(bytes, &j); err != nil {
+			fmt.Printf(err.Error())
+			return
+		}
+		for _, job := range s.jobs {
+			if job.ID == j.Job.ID {
+				job.mu.Lock()
+				job.BodyResponse = j.Job.Body
+				job.toFinished()
+				job.Trace = append(job.Trace, NewJobTrace(s.ID, JobStatusFinished, s.Conn.Socket.RemoteAddr()))
+				job.mu.Unlock()
+				s.finCh <- job.ID
+			}
+		}
 	}
 }
 
-func (s *Session) sendJob(j *Job) {
+func (s *Session) sendPing() error {
+	m := &PingMessage{Proto: Proto{SessionID: s.ID, Kind: PingMessageKind}}
+	bytes, err := json.Marshal(&m)
+	if err != nil {
+		return err
+	}
+	if err := s.Conn.Write(bytes); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Session) sendJob(j *Job) error {
 	m := &JobMessage{
 		Job: struct {
 			ID   uuid.UUID `json:"id"`
@@ -402,11 +436,12 @@ func (s *Session) sendJob(j *Job) {
 	}
 	bytes, err := json.Marshal(&m)
 	if err != nil {
-		fmt.Printf(err.Error())
+		return err
 	}
 	if err := s.Conn.Write(bytes); err != nil {
-		fmt.Printf(err.Error())
+		return err
 	}
+	return nil
 }
 
 func newSession(conn *Conn) *Session {
