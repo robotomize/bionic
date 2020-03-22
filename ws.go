@@ -3,14 +3,7 @@ package bionic
 import (
 	"github.com/gorilla/websocket"
 	"github.com/opentracing/opentracing-go/log"
-	"net/http"
 )
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
 
 type Conn struct {
 	Socket *websocket.Conn
@@ -18,13 +11,19 @@ type Conn struct {
 }
 
 func NewConn(socket *websocket.Conn) *Conn {
-	return &Conn{
+	c := &Conn{
 		Socket: socket,
 		wrCh:   make(chan []byte, 1),
 	}
+	c.read()
+	return c
 }
 
-func (c *Conn) Read() {
+func (c *Conn) Read() <-chan []byte {
+	return c.wrCh
+}
+
+func (c *Conn) read() {
 	go func() {
 		for {
 			_, data, err := c.Socket.ReadMessage()

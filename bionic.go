@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/opentracing/opentracing-go/log"
 	"github.com/tidwall/gjson"
 	"github.com/valyala/fastrand"
@@ -19,14 +20,20 @@ func New() *Manager {
 	return manager
 }
 
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
 const (
-	DefaultRunnerNumber     = 1
-	DefaultMaxExecutionTime = 30 * time.Second
+	defaultRunnerNumber     = 1
+	defaultMaxExecutionTime = 30 * time.Second
 )
 
 var defaultOptions = ManagerOptions{
-	runnerNumber:  DefaultRunnerNumber,
-	executionTime: DefaultMaxExecutionTime,
+	runnerNumber:  defaultRunnerNumber,
+	executionTime: defaultMaxExecutionTime,
 }
 
 type Manager struct {
@@ -74,7 +81,6 @@ func (m *Manager) Serve() {
 			return
 		}
 		conn := NewConn(socket)
-		conn.Read()
 		session := newSession(conn)
 		session.finCh = m.finCh
 		session.start()
@@ -301,7 +307,7 @@ func (s *Session) read(ctx context.Context) {
 		var j *JobMessage
 		for {
 			select {
-			case bytes := <-s.Conn.wrCh:
+			case bytes := <-s.Conn.Read():
 				kind := uint8(gjson.GetBytes(bytes, "proto.kind").Int())
 				switch kind {
 				case PongMessageKind:

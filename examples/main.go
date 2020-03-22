@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bionic"
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
+	"github.com/robotomize/bionic"
 	"github.com/valyala/fastrand"
 	"math"
 	"net/http"
@@ -90,7 +90,7 @@ func NewClient() {
 		j.Job.Payload = bytes
 		return nil
 	})
-	go c.Read()
+	go c.Listen()
 }
 
 func main() {

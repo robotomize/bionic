@@ -23,9 +23,8 @@ func (c *Client) Send(bytes []byte) error {
 	return c.Conn.Write(bytes)
 }
 
-func (c *Client) Read() {
-	c.Conn.Read()
-	for p := range c.Conn.wrCh {
+func (c *Client) Listen() {
+	for p := range c.Conn.Read() {
 		c.handle(p)
 	}
 }
