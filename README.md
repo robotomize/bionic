@@ -7,11 +7,13 @@ Bionic is made to quickly deploy distributed computing involving user hosts. Web
 ### install
 This version is not for use in production.
 
-``` go get github.com/robotomize/bionic```
+```shell
+go get github.com/robotomize/bionic
+```
 
 A client calculating pi may look like this
 
-``` 
+```go
 c, err := bionic.NewClient("ws://localhost:9090/ws", http.Header{"Cookie": []string{}})
 	if err != nil {
 		fmt.Printf(err.Error())
