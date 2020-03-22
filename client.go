@@ -6,6 +6,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
+	"net/http"
 )
 
 type HandlerFunc func(*JobMessage) error
@@ -15,8 +16,12 @@ type Client struct {
 	handlers map[string]HandlerFunc
 }
 
-func NewClient(conn *websocket.Conn) *Client {
-	return &Client{Conn: NewConn(conn), handlers: map[string]HandlerFunc{}}
+func NewClient(url string, header http.Header) (*Client, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(url, header)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{Conn: NewConn(conn), handlers: map[string]HandlerFunc{}}, nil
 }
 
 func (c *Client) Send(bytes []byte) error {

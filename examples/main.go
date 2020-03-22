@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"github.com/robotomize/bionic"
 	"github.com/valyala/fastrand"
 	"math"
@@ -68,11 +67,11 @@ func NewServer() *bionic.Manager {
 }
 
 func NewClient() {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:9090/ws", http.Header{"Cookie": []string{}})
+	c, err := bionic.NewClient("ws://localhost:9090/ws", http.Header{"Cookie": []string{}})
 	if err != nil {
 		fmt.Printf(err.Error())
+		os.Exit(2)
 	}
-	c := bionic.NewClient(conn)
 	c.RegisterHandlers("pi", func(j *bionic.JobMessage) error {
 		var req *PiJobReq
 		if err := json.Unmarshal(j.Job.Payload, &req); err != nil {
@@ -85,7 +84,6 @@ func NewClient() {
 		if err != nil {
 			return err
 		}
-
 		j.Proto.Kind = bionic.JobCompletedMessageKind
 		j.Job.Payload = bytes
 		return nil
