@@ -12,11 +12,12 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-func New() *Manager {
-	manager := NewManager(MaxExecutionTime(30 * time.Second))
+func New() *Dispatcher {
+	manager := NewDispatcher(MaxExecutionTime(30 * time.Second))
 	return manager
 }
 
@@ -36,33 +37,30 @@ var defaultOptions = ManagerOptions{
 	executionTime: defaultMaxExecutionTime,
 }
 
-type Manager struct {
+type Dispatcher struct {
 	hooks map[string][]HookFunc
 
 	opts   ManagerOptions
 	cancel func()
 
-	cMu sync.RWMutex
-
-	finCh chan uuid.UUID
-	jobs  map[uuid.UUID]*Job
-
+	finCh   chan uuid.UUID
 	eventCh chan struct{}
 
+	mu       sync.RWMutex
+	jobs     map[uuid.UUID]*Job
 	sessions []*Session
 }
 
-func NewManager(opt ...ManagerOption) *Manager {
+func NewDispatcher(opt ...ManagerOption) *Dispatcher {
 	opts := defaultOptions
 	for _, o := range opt {
 		o.apply(&opts)
 	}
-	m := &Manager{
+	m := &Dispatcher{
 		hooks:    map[string][]HookFunc{},
 		opts:     opts,
 		cancel:   nil,
 		finCh:    make(chan uuid.UUID, 1),
-		cMu:      sync.RWMutex{},
 		sessions: []*Session{},
 		jobs:     map[uuid.UUID]*Job{},
 		eventCh:  make(chan struct{}, 1),
@@ -70,7 +68,7 @@ func NewManager(opt ...ManagerOption) *Manager {
 	return m
 }
 
-func (m *Manager) Serve() {
+func (m *Dispatcher) Serve() {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.handling(ctx)
@@ -95,7 +93,7 @@ func (m *Manager) Serve() {
 	}()
 }
 
-func (m *Manager) Stop() {
+func (m *Dispatcher) Stop() {
 	m.cancel()
 	for _, s := range m.sessions {
 		s.stop()
@@ -130,13 +128,13 @@ func MaxExecutionTime(t time.Duration) ManagerOption {
 	})
 }
 
-func (m *Manager) handling(ctx context.Context) {
+func (m *Dispatcher) handling(ctx context.Context) {
 	go func() {
 		for {
 			select {
 			case id := <-m.finCh:
 				job := m.jobs[id]
-				m.execHooks(job.Kind, job.PayloadResponse)
+				m.execHooks(job.Kind, job.BodyResponse)
 				job.Status = JobStatusDeleted
 				job.Trace = append(job.Trace, NewJobTrace([16]byte{}, JobStatusDeleted, nil))
 			case <-m.eventCh:
@@ -148,7 +146,7 @@ func (m *Manager) handling(ctx context.Context) {
 	}()
 }
 
-func (m *Manager) schedule() {
+func (m *Dispatcher) schedule() {
 	for _, job := range m.jobs {
 		if job.Status == JobStatusWaiting && len(m.sessions) > 0 {
 			n := fastrand.Uint32n(uint32(len(m.sessions) - 1))
@@ -157,28 +155,24 @@ func (m *Manager) schedule() {
 	}
 }
 
-func (m *Manager) AddJob(j *Job) {
+func (m *Dispatcher) AddJob(j *Job) {
 	j.Status = JobStatusWaiting
 	j.Trace = append(j.Trace, NewJobTrace([16]byte{}, JobStatusWaiting, nil))
 	m.jobs[j.ID] = j
 	m.eventCh <- struct{}{}
 }
 
-func (m *Manager) DeleteJob() {
+func (m *Dispatcher) CancelJob(ID uuid.UUID) {
 
-}
-
-func (m *Manager) GetSessions() []*Session {
-	return m.sessions
 }
 
 type HookFunc func([]byte) error
 
-func (m *Manager) AddHook(kind string, h ...HookFunc) {
+func (m *Dispatcher) AddHook(kind string, h ...HookFunc) {
 	m.hooks[kind] = append(m.hooks[kind], h...)
 }
 
-func (m *Manager) execHooks(kind string, payload []byte) {
+func (m *Dispatcher) execHooks(kind string, payload []byte) {
 	if _, ok := m.hooks[kind]; ok {
 		for _, h := range m.hooks[kind] {
 			if err := h(payload); err != nil {
@@ -189,45 +183,89 @@ func (m *Manager) execHooks(kind string, payload []byte) {
 }
 
 const (
-	JobStatusWaiting uint8 = iota
+	JobStatusWaiting uint32 = iota
 	JobStatusWorking
 	JobStatusFinished
+	JobStatusCancelled
 	JobStatusDeleted
 )
 
 type JobTrace struct {
 	sessionID uuid.UUID
-	status    uint8
+	status    uint32
 	timestamp int64
 	addr      net.Addr
 }
 
-func NewJobTrace(sessionID uuid.UUID, status uint8, addr net.Addr) JobTrace {
+func NewJobTrace(sessionID uuid.UUID, status uint32, addr net.Addr) JobTrace {
 	return JobTrace{sessionID: sessionID, status: status, addr: addr}
 }
 
 type Job struct {
-	ID              uuid.UUID
-	Status          uint8
-	Kind            string
-	ExecutionTime   int64
-	Trace           []JobTrace
-	PayloadRequest  []byte
-	PayloadResponse []byte
+	ID     uuid.UUID
+	Status uint32
+
+	mu            sync.RWMutex
+	Kind          string
+	ExecutionTime int64
+	Trace         []JobTrace
+	BodyRequest   []byte
+	BodyResponse  []byte
 }
 
-func NewJob(kind string, reqPayload []byte, execTime int64) *Job {
+func NewJob(kind string, body []byte, execTime int64) *Job {
 	return &Job{
-		ID:             uuid.New(),
-		Kind:           kind,
-		ExecutionTime:  execTime,
-		PayloadRequest: reqPayload,
-		Status:         JobStatusWaiting,
+		ID:            uuid.New(),
+		Kind:          kind,
+		ExecutionTime: execTime,
+		BodyRequest:   body,
+		Status:        JobStatusWaiting,
+		Trace:         []JobTrace{},
 	}
 }
 
+func (s *Job) isWaiting() bool {
+	return atomic.LoadUint32(&s.Status) == JobStatusWaiting
+}
+
+func (s *Job) isWorking() bool {
+	return atomic.LoadUint32(&s.Status) == JobStatusWorking
+}
+
+func (s *Job) isCancelled() bool {
+	return atomic.LoadUint32(&s.Status) == JobStatusCancelled
+}
+
+func (s *Job) isFinished() bool {
+	return atomic.LoadUint32(&s.Status) == JobStatusFinished
+}
+
+func (s *Job) isDeleted() bool {
+	return atomic.LoadUint32(&s.Status) == JobStatusDeleted
+}
+
+func (s *Job) toWaiting() {
+	atomic.StoreUint32(&s.Status, JobStatusWaiting)
+}
+
+func (s *Job) toWorking() {
+	atomic.StoreUint32(&s.Status, JobStatusWorking)
+}
+
+func (s *Job) toCancelled() {
+	atomic.StoreUint32(&s.Status, JobStatusCancelled)
+}
+
+func (s *Job) toFinished() {
+	atomic.StoreUint32(&s.Status, JobStatusFinished)
+}
+
+func (s *Job) toDeleted() {
+	atomic.StoreUint32(&s.Status, JobStatusDeleted)
+}
+
 const (
-	SessionStatusWaiting uint8 = iota
+	SessionStatusWaiting uint32 = iota
 	SessionStatusWorking
 	SessionStatusDisconnected
 	SessionStatusLocked
@@ -241,15 +279,18 @@ const (
 
 type Session struct {
 	ID       uuid.UUID
-	mu       sync.RWMutex
-	jobs     []*Job
-	closeCh  chan uuid.UUID
-	evCh     chan struct{}
-	finCh    chan uuid.UUID
-	Status   uint8
-	connIncr int
-	Conn     *Conn
-	cancel   func()
+	Status   uint32
+	connIncr uint32
+
+	evCh    chan struct{}
+	finCh   chan uuid.UUID
+	closeCh chan uuid.UUID
+
+	mu   sync.RWMutex
+	jobs []*Job
+	Conn *Conn
+
+	cancel func()
 }
 
 func (s *Session) start() {
@@ -281,7 +322,7 @@ func (s *Session) connIncrTimer(ctx context.Context) {
 		for {
 			select {
 			case <-t.C:
-				s.connIncr += updateTimeValue
+				atomic.AddUint32(&s.connIncr, updateTimeValue)
 			case <-ctx.Done():
 				return
 			}
@@ -318,7 +359,7 @@ func (s *Session) read(ctx context.Context) {
 					}
 					for _, job := range s.jobs {
 						if job.ID == j.Job.ID {
-							job.PayloadResponse = j.Job.Payload
+							job.BodyResponse = j.Job.Body
 							job.Status = JobStatusFinished
 							job.Trace = append(job.Trace, NewJobTrace(s.ID, JobStatusFinished, s.Conn.Socket.RemoteAddr()))
 							s.finCh <- job.ID
@@ -346,13 +387,13 @@ func (s *Session) sendPing() {
 func (s *Session) sendJob(j *Job) {
 	m := &JobMessage{
 		Job: struct {
-			ID      uuid.UUID `json:"id"`
-			Kind    string    `json:"kind"`
-			Payload []byte    `json:"payload"`
+			ID   uuid.UUID `json:"id"`
+			Kind string    `json:"kind"`
+			Body []byte    `json:"body"`
 		}{
-			ID:      j.ID,
-			Kind:    j.Kind,
-			Payload: j.PayloadRequest,
+			ID:   j.ID,
+			Kind: j.Kind,
+			Body: j.BodyRequest,
 		},
 		Proto: Proto{
 			SessionID: s.ID,
@@ -380,18 +421,34 @@ func newSession(conn *Conn) *Session {
 	}
 }
 
+func (s *Session) isWorking() bool {
+	return atomic.LoadUint32(&s.Status) == SessionStatusWorking
+}
+
+func (s *Session) isWaiting() bool {
+	return atomic.LoadUint32(&s.Status) == SessionStatusWaiting
+}
+
+func (s *Session) isDisconnected() bool {
+	return atomic.LoadUint32(&s.Status) == SessionStatusDisconnected
+}
+
+func (s *Session) isLocked() bool {
+	return atomic.LoadUint32(&s.Status) == SessionStatusLocked
+}
+
 func (s *Session) toWorking() {
-	s.Status = SessionStatusWorking
+	atomic.StoreUint32(&s.Status, SessionStatusWorking)
 }
 
 func (s *Session) toWaiting() {
-	s.Status = SessionStatusWaiting
+	atomic.StoreUint32(&s.Status, SessionStatusWaiting)
 }
 
 func (s *Session) toDisconnected() {
-	s.Status = SessionStatusDisconnected
+	atomic.StoreUint32(&s.Status, SessionStatusDisconnected)
 }
 
 func (s *Session) toLocked() {
-	s.Status = SessionStatusLocked
+	atomic.StoreUint32(&s.Status, SessionStatusLocked)
 }

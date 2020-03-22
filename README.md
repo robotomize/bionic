@@ -1,6 +1,6 @@
 # bionic
 
-This is a simple and easy-to-configure system for distributing tasks between multiple network client nodes.
+This is a simple and easy-to-configure distributed task queue.
 
 Bionic is made to quickly deploy distributed computing involving user hosts. Websocket is used as a transport.
 

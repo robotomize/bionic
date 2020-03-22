@@ -38,7 +38,7 @@ type PiJobResp struct {
 	Pi float64 `json:"pi"`
 }
 
-func NewServer() *bionic.Manager {
+func NewServer() *bionic.Dispatcher {
 	b := bionic.New()
 	b.AddHook("pi", func(bytes []byte) error {
 		file, openErr := os.OpenFile("./examples/response.json", os.O_RDWR|os.O_APPEND|os.O_CREATE, os.FileMode(0755))
@@ -74,7 +74,7 @@ func NewClient() {
 	}
 	c.RegisterHandlers("pi", func(j *bionic.JobMessage) error {
 		var req *PiJobReq
-		if err := json.Unmarshal(j.Job.Payload, &req); err != nil {
+		if err := json.Unmarshal(j.Job.Body, &req); err != nil {
 			return err
 		}
 		n := req.N
@@ -85,7 +85,7 @@ func NewClient() {
 			return err
 		}
 		j.Proto.Kind = bionic.JobCompletedMessageKind
-		j.Job.Payload = bytes
+		j.Job.Body = bytes
 		return nil
 	})
 	go c.Listen()

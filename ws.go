@@ -37,7 +37,7 @@ func (c *Conn) read() {
 }
 
 func (c *Conn) Write(bytes []byte) error {
-	return c.Socket.WriteMessage(websocket.TextMessage, bytes)
+	return c.Socket.WriteMessage(websocket.BinaryMessage, bytes)
 }
 
 func (c *Conn) Close() {

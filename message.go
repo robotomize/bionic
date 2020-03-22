@@ -20,9 +20,9 @@ type PingMessage struct {
 
 type JobMessage struct {
 	Job struct {
-		ID      uuid.UUID `json:"id"`
-		Kind    string    `json:"kind"`
-		Payload []byte    `json:"payload"`
+		ID   uuid.UUID `json:"id"`
+		Kind string    `json:"kind"`
+		Body []byte    `json:"body"`
 	} `json:"job"`
 	Proto Proto `json:"proto"`
 }
